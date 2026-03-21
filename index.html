@@ -908,25 +908,11 @@ function sugerirUsuario(nombre){
   if(limpio.length===1) return limpio[0];
   return `${limpio[0]}.${limpio[1]}`;
 }
-function normalizarPasswordEmpleado(e){
-  const esSupervisor = (String(e?.usuario||'').trim().toLowerCase()==='ortega.carlos') || (String(e?.nombre||'').toLowerCase().includes('ortega carlos')) || e?.cargo==='Encargado';
-  let pwd = (e?.password ?? '').toString();
-  if(!esSupervisor && pwd==='1234') pwd='';
-  if(esSupervisor) pwd='864088';
-  return pwd;
-}
-function normalizarEmpleadoCredenciales(e){
-  const base={...e};
-  const esSupervisor = (String(base.usuario||'').trim().toLowerCase()==='ortega.carlos') || (String(base.nombre||'').toLowerCase().includes('ortega carlos')) || base.cargo==='Encargado';
-  base.usuario = esSupervisor ? 'ortega.carlos' : (base.usuario || sugerirUsuario(base.nombre));
-  base.password = normalizarPasswordEmpleado(base);
-  if(esSupervisor) base.activo = true;
-  return base;
-}
-function sanitizarCredencialesEmpleados(){
-  empleados=(empleados||[]).map(normalizarEmpleadoCredenciales);
-}
-empleados=empleados.map(normalizarEmpleadoCredenciales);
+empleados=empleados.map(e=>({
+  ...e,
+  usuario:e.usuario||sugerirUsuario(e.nombre),
+  password:e.password||'1234'
+}));
 
 const EMPLEADOS_KEY='basecontrol_empleados';
 const CELULARES_KEY='controlserenos_celulares';
@@ -947,7 +933,7 @@ function cargarEmpleadosDeStorage(){
     if(!raw) return;
     const guardados=JSON.parse(raw);
     if(Array.isArray(guardados) && guardados.length){
-      empleados=guardados.map(e=>normalizarEmpleadoCredenciales({activo:true,tel:'',cargo:'Sereno',...e}));
+      empleados=guardados.map(e=>({activo:true,tel:'',cargo:'Sereno',...e,usuario:e.usuario||sugerirUsuario(e.nombre),password:e.password||'1234'}));
     }
   }catch(e){}
 }
@@ -969,7 +955,7 @@ function asegurarCredencialesIniciales(){
   let encargado = empleados.find(e => String(e.nombre||'').toLowerCase().includes('ortega carlos') || e.cargo==='Encargado');
   if(encargado){
     encargado.usuario = 'ortega.carlos';
-    encargado.password = '864088';
+    encargado.password = '1234';
     encargado.activo = true;
   } else {
     empleados.push({
@@ -979,7 +965,7 @@ function asegurarCredencialesIniciales(){
       tel:'',
       activo:true,
       usuario:'ortega.carlos',
-      password:'864088'
+      password:'1234'
     });
   }
   guardarEmpleadosEnStorage();
@@ -1850,7 +1836,6 @@ function importarRespaldo(ev){
       nextCelId = Number(data.nextCelId||nextCelId);
       semanaActual = data.semanaActual || semanaActual;
       vistaSemana = data.vistaSemana || vistaSemana;
-      sanitizarCredencialesEmpleados();
 
       try{ localStorage.setItem(EMPLEADOS_KEY, JSON.stringify(empleados)); }catch(e){}
       try{ localStorage.setItem(CELULARES_KEY, JSON.stringify(celulares)); }catch(e){}
@@ -1861,9 +1846,6 @@ function importarRespaldo(ev){
       try{ localStorage.setItem('basecontrol_fichajes_turno', JSON.stringify(fichajesXTurno)); }catch(e){}
       try{ localStorage.setItem('basecontrol_novedades', JSON.stringify(novedades)); }catch(e){}
       try{ localStorage.setItem('basecontrol_novedades_turno', JSON.stringify(novedadesXTurno)); }catch(e){}
-      try{ fbSet('horarios', horarios); }catch(e){}
-      try{ guardarCelularesEnNube(); }catch(e){}
-      try{ syncEmpleadosEnNube(); }catch(e){}
 
       poblarSelects();
       aplicarPermisosUI();
@@ -2076,20 +2058,21 @@ function restablecerPermisosUsuarioActual(){
   toast('Permisos restablecidos según el rol');
 }
 
-function actualizarSessionUI(){
-  const box=document.getElementById('session-box');
-  if(!box) return;
-  if(currentUser){
-    box.style.display='flex';
-    document.getElementById('session-name').textContent=currentUser.nombre||'—';
-    document.getElementById('session-role').textContent=currentUser.cargo||'—';
-  }
-}
-
 function iniciarSesion(){
   const usuario=(document.getElementById('login-usuario').value||'').trim();
   const password=(document.getElementById('login-password').value||'').trim();
   const error=document.getElementById('login-error');
+  if(usuario==='ortega.carlos' && password==='1234'){
+    currentUser={id:9999,nombre:'Ortega Carlos',cargo:'Encargado',usuario:'ortega.carlos'};
+    try{ localStorage.setItem(SESION_KEY, JSON.stringify({id:9999})); }catch(e){}
+    error.style.display='none';
+    document.getElementById('login-overlay').style.display='none';
+    aplicarPermisosUI();
+    prepararSesionSegunUsuario();
+    cargarNotasDeStorage();
+    toast('Bienvenido');
+    return;
+  }
   const user=empleados.find(e=>e.activo && (e.usuario||'')===usuario && (e.password||'')===password);
   if(!user){ error.style.display='block'; return; }
   currentUser={id:user.id,nombre:user.nombre,cargo:user.cargo,usuario:user.usuario};
@@ -2891,16 +2874,58 @@ function showTab(tab,el){
 }
 
 // ══ FICHAJE ══
-function obtenerContextoTurnoActual(empId, fechaRef=ahora()){
+const GRACIA_FIN_TURNO_MIN = 180;
+function turnoIncluyeMomento(fechaSlot, horaRango, ts, tipo='general'){
+  if(!horaRango || !fechaSlot) return false;
+  const m = String(horaRango).match(/(\d{2}):(\d{2}).*?(\d{2}):(\d{2})/);
+  if(!m) return false;
+  const iniH = parseInt(m[1],10), iniM = parseInt(m[2],10);
+  const finH = parseInt(m[3],10), finM = parseInt(m[4],10);
+  const inicio = new Date(fechaSlot);
+  inicio.setHours(iniH, iniM, 0, 0);
+  const fin = new Date(fechaSlot);
+  fin.setHours(finH, finM, 0, 0);
+  const cruzaMedianoche = fin <= inicio;
+  if(cruzaMedianoche) fin.setDate(fin.getDate()+1);
+  const finComparacion = new Date(fin);
+  if(cruzaMedianoche && (tipo==='salida' || tipo==='reporte' || tipo==='general')) {
+    finComparacion.setMinutes(finComparacion.getMinutes()+GRACIA_FIN_TURNO_MIN);
+  }
+  return ts >= inicio && ts <= finComparacion;
+}
+function obtenerContextoTurnoActual(empId, fechaRef=ahora(), tipo='general'){
   const ts = fechaRef instanceof Date ? fechaRef : new Date(fechaRef);
+  const candidatos=[new Date(ts), new Date(ts)];
+  candidatos[1].setDate(candidatos[1].getDate()-1);
+  for(const fechaSlot of candidatos){
+    const sem=semStr(lunesDeHoy(fechaSlot));
+    const di=(fechaSlot.getDay()||7)-1;
+    const chT=getH(sem,'chales_t',di), chN=getH(sem,'chales_n',di);
+    if(empId===20 && ((chT&&chT.empId===20)||(chN&&chN.empId===20))){
+      const turnoEspecial={base:'Chales',baseId:'chales',turnoId:'chales_t',hora:'11:00–23:00'};
+      if(turnoIncluyeMomento(fechaSlot, turnoEspecial.hora, ts, tipo)){
+        return {sem,di,turno:turnoEspecial,key:slotKey(empId,sem,turnoEspecial.turnoId,di)};
+      }
+    }
+    for(const base of BASES){
+      for(const turno of base.turnos){
+        const h=getH(sem,turno.id,di);
+        if(!(h && h.empId===empId)) continue;
+        if(turnoIncluyeMomento(fechaSlot, turno.hora, ts, tipo)){
+          const t={base:base.nombre,baseId:base.id,turnoId:turno.id,hora:turno.hora};
+          return {sem,di,turno:t,key:slotKey(empId,sem,turno.id,di)};
+        }
+      }
+    }
+  }
   const sem=semStr(lunesDeHoy(ts));
   const di=(ts.getDay()||7)-1;
   const t=getTurnoHoy(empId);
   if(!t) return {sem,di,turno:null,key:null};
   return {sem,di,turno:t,key:slotKey(empId,sem,t.turnoId,di)};
 }
-function obtenerEstadoTurnoActual(empId, fechaRef=ahora()){
-  const ctx=obtenerContextoTurnoActual(empId, fechaRef);
+function obtenerEstadoTurnoActual(empId, fechaRef=ahora(), tipo='general'){
+  const ctx=obtenerContextoTurnoActual(empId, fechaRef, tipo);
   const fich=ctx.key ? (fichajesXTurno[ctx.key]||{}) : {};
   const nov=ctx.key ? (novedadesXTurno[ctx.key]||null) : null;
   return {ctx,fich,nov};
@@ -2934,7 +2959,8 @@ function actualizarInfoFichaje(){
     actualizarEstadoBotonFichaje(null);
     return;
   }
-  const estado=obtenerEstadoTurnoActual(empId);
+  const tipoSel=document.querySelector('input[name="f-tipo"]:checked')?.value||'entrada';
+  const estado=obtenerEstadoTurnoActual(empId, ahora(), tipoSel==='salida' ? 'salida' : 'entrada');
   const t=estado.ctx.turno;
   if(t){
     if(baseInput) baseInput.value=t.base;
@@ -2970,7 +2996,7 @@ async function registrarFichaje(){
     return;
   }
   const ts=ahora();
-  const estado=obtenerEstadoTurnoActual(empId, ts);
+  const estado=obtenerEstadoTurnoActual(empId, ts, tipo==='salida' ? 'salida' : 'entrada');
   const turnoActual=estado.ctx.turno;
   if(!turnoActual){toast('⚠️ El sereno no tiene un turno asignado para hoy');return;}
   const tipo=document.querySelector('input[name="f-tipo"]:checked').value;
@@ -2990,13 +3016,16 @@ async function registrarFichaje(){
   _guardarFichaje(empId,base,tipo,ts,emp,gpsActual?`${gpsActual.lat.toFixed(5)}, ${gpsActual.lng.toFixed(5)}`:'');
 }
 function _guardarFichaje(empId,base,tipo,ts,emp,gps=''){
-  const t=getTurnoHoy(empId);
+  const estado=obtenerEstadoTurnoActual(empId, ts, tipo==='salida' ? 'salida' : 'entrada');
+  const ctx=estado.ctx||{};
+  const t=ctx.turno || getTurnoHoy(empId);
   const turnoId=t?t.turnoId:null;
   const hora=t?t.hora:'—';
-  const sem=semStr(lunesDeHoy(ts));const di=(ts.getDay()||7)-1;
-  let key=null;
+  const sem=ctx.sem || semStr(lunesDeHoy(ts));
+  const di=(ctx.di ?? ((ts.getDay()||7)-1));
+  let key=ctx.key || null;
   if(turnoId){
-    key=slotKey(empId,sem,turnoId,di);
+    if(!key) key=slotKey(empId,sem,turnoId,di);
     const existente=fichajesXTurno[key]||{};
     if(existente[tipo]){
       toast(`⚠️ La ${tipo} de este turno ya fue registrada.`);
@@ -3043,8 +3072,11 @@ function confirmarSalidaConNovedad(){
   const tipo=document.getElementById('mno-tipo').value;
   if(!salidaPendiente)return;
   const{empId,base,ts,emp,gps,slotKey:slotPendiente}=salidaPendiente;
-  const t=getTurnoHoy(empId);
-  const sem=semStr(lunesDeHoy(ts));const di=(ts.getDay()||7)-1;
+  const estadoTurno=obtenerEstadoTurnoActual(empId, ts, 'reporte');
+  const ctxTurno=estadoTurno.ctx||{};
+  const t=ctxTurno.turno || getTurnoHoy(empId);
+  const sem=ctxTurno.sem || semStr(lunesDeHoy(ts));
+  const di=(ctxTurno.di ?? ((ts.getDay()||7)-1));
   const key = slotPendiente || (t ? slotKey(empId,sem,t.turnoId,di) : null);
   if(key && novedadesXTurno[key]){
     toast('⚠️ El reporte de este turno ya fue enviado.');
@@ -3164,7 +3196,7 @@ function eliminarFilaControl(groupKey){
   if(!protegerEdicion()) return;
   const g=controlRowsCache.find(x=>x.key===groupKey);
   if(!g) return;
-  if(!confirm('¿Eliminar toda la fila? Se borrarán entrada, salida y reporte de este turno, pero el horario asignado se mantendrá.')) return;
+  if(!confirm('¿Eliminar toda la fila? Se borrarán entrada, salida y reporte de este turno.')) return;
 
   const fichajesABorrar = fichajes.filter(f=>esMismaFilaControlRegistro(f,g));
   const novedadesABorrar = novedades.filter(n=>esMismaFilaControlRegistro(n,g));
@@ -3174,13 +3206,18 @@ function eliminarFilaControl(groupKey){
   delete fichajesXTurno[g.key];
   delete novedadesXTurno[g.key];
 
+  const h=getH(g.sem,g.turnoId,g.di);
+  if(h && Number(h.empId)===Number(g.empId) && h.origen==='fichaje'){
+    setH(g.sem,g.turnoId,g.di,null,null);
+  }
+
   if(fbReady){
     fichajesABorrar.forEach(f=>{
       const fbKey = f._fbKey || fbFichajesKeys[f.id];
       if(fbKey) fbRemove('fichajes/'+fbKey);
     });
     novedadesABorrar.forEach(n=>{
-      const fbKey = n._fbKey || n.fbKey || fbNovedadesKeys[n.id] || fbNovedadesKeys[g.key];
+      const fbKey = n._fbKey;
       if(fbKey) fbRemove('novedades/'+fbKey);
     });
   }
@@ -3237,13 +3274,10 @@ function guardarHorarioManual(groupKey,tipo,valorManual){
   const val=valorManual;
   if(!val){ toast('⚠️ Indicá una hora válida'); return; }
   const [hh,mm]=val.split(':').map(Number);
-  if(!fichajesXTurno[g.key]) fichajesXTurno[g.key]={entrada:null,salida:null,gpsEntrada:'',gpsSalida:''};
+  if(!fichajesXTurno[g.key]) fichajesXTurno[g.key]={entrada:null,salida:null};
   fichajesXTurno[g.key][tipo]=val;
 
   let actualizado=false;
-  let fichajeEditado=null;
-  let tsEditado=null;
-
   fichajes.forEach(f=>{
     const fFecha=fmtDate(new Date(f.ts));
     if(f.empId===g.empId && f.base===g.base && f.turnoId===g.turnoId && fFecha===fmtDate(g.fechaObj) && f.tipo===tipo){
@@ -3252,47 +3286,13 @@ function guardarHorarioManual(groupKey,tipo,valorManual){
       f.ts=nuevo;
       f.hora=g.hora;
       actualizado=true;
-      fichajeEditado=f;
-      tsEditado=nuevo;
     }
   });
-
   if(!actualizado){
     const ts=new Date(g.fechaObj);
     ts.setHours(hh,mm,0,0);
-    const nuevoFichaje={id:nextFicId++,empId:g.empId,emp:g.emp,base:g.base,turnoId:g.turnoId,hora:g.hora,tipo,ts,gps:''};
-    fichajes.unshift(nuevoFichaje);
-    fichajeEditado=nuevoFichaje;
-    tsEditado=ts;
+    fichajes.unshift({id:nextFicId++,empId:g.empId,emp:g.emp,base:g.base,turnoId:g.turnoId,hora:g.hora,tipo,ts});
   }
-
-  guardarFichajesLocales();
-  persistirControlLocal();
-
-  if(fbReady && fichajeEditado){
-    const payload = {
-      id: fichajeEditado.id,
-      empId: fichajeEditado.empId,
-      empNombre: fichajeEditado.emp ? fichajeEditado.emp.nombre : (g.emp?.nombre || ''),
-      base: fichajeEditado.base,
-      turnoId: fichajeEditado.turnoId || null,
-      hora: fichajeEditado.hora || g.hora || '—',
-      tipo: fichajeEditado.tipo,
-      ts: (tsEditado || fichajeEditado.ts || new Date()).toISOString(),
-      gps: fichajeEditado.gps || ''
-    };
-    const fbKey = fichajeEditado._fbKey || fbFichajesKeys[fichajeEditado.id];
-    if(fbKey){
-      fbUpdate('fichajes/'+fbKey, payload);
-    }else{
-      const ref = fbPush('fichajes', payload);
-      if(ref && ref.key){
-        fichajeEditado._fbKey = ref.key;
-        fbFichajesKeys[fichajeEditado.id] = ref.key;
-      }
-    }
-  }
-
   renderControl(); renderDashboard(); renderVista();
 renderSeguridad(); actualizarInfoFichaje();
   toast(`Horario de ${tipo} ${actualizado?'actualizado':'cargado manualmente'}`);
@@ -3303,73 +3303,17 @@ function guardarReporteManual(groupKey,tipo,texto){
   if(!g) return;
   const limpio=(texto||'').trim();
   if(!limpio){ toast('⚠️ Escribí el reporte'); return; }
-
-  let reporteAnterior=null;
-  novedades.forEach(n=>{
-    if(n.empId===g.empId && n.turnoId===g.turnoId && fmtDate(new Date(n.ts))===fmtDate(g.fechaObj)){
-      reporteAnterior=n;
-    }
-  });
-
-  const nov={
-    empId:g.empId,
-    emp:g.emp,
-    empNombre:g.emp?.nombre || '',
-    base:g.base,
-    turno:g.hora,
-    turnoId:g.turnoId,
-    sem:g.sem,
-    di:g.di,
-    tipo,
-    texto:limpio,
-    ts: reporteAnterior?.ts ? new Date(reporteAnterior.ts) : ahora()
-  };
-  if(reporteAnterior && reporteAnterior._fbKey) nov._fbKey = reporteAnterior._fbKey;
-
+  const nov={empId:g.empId,emp:g.emp,base:g.base,turno:g.hora,turnoId:g.turnoId,tipo,texto:limpio,ts:ahora()};
   novedadesXTurno[g.key]=nov;
   let reemplazado=false;
   novedades=novedades.map(n=>{
     if(n.empId===g.empId && n.turnoId===g.turnoId && fmtDate(new Date(n.ts))===fmtDate(g.fechaObj)){
       reemplazado=true;
-      return {...n, ...nov};
+      return nov;
     }
     return n;
   });
   if(!reemplazado) novedades.unshift(nov);
-
-  guardarNovedadesLocales();
-  persistirControlLocal();
-
-  if(fbReady){
-    const payload = {
-      empId: nov.empId,
-      empNombre: nov.empNombre || '',
-      base: nov.base || '',
-      turno: nov.turno || '',
-      turnoId: nov.turnoId || null,
-      sem: nov.sem || null,
-      di: nov.di!==undefined ? nov.di : null,
-      tipo: nov.tipo || 'otro',
-      texto: nov.texto || '',
-      ts: new Date(nov.ts || new Date()).toISOString(),
-      tsEdicionSupervisor: new Date().toISOString()
-    };
-    const fbKey = nov._fbKey || reporteAnterior?._fbKey || fbNovedadesKeys[g.key];
-    if(fbKey){
-      fbUpdate('novedades/'+fbKey, payload);
-      nov._fbKey = fbKey;
-      fbNovedadesKeys[g.key] = fbKey;
-      if(reporteAnterior) reporteAnterior._fbKey = fbKey;
-    }else{
-      const ref = fbPush('novedades', payload);
-      if(ref && ref.key){
-        nov._fbKey = ref.key;
-        fbNovedadesKeys[g.key] = ref.key;
-        if(reporteAnterior) reporteAnterior._fbKey = ref.key;
-      }
-    }
-  }
-
   renderControl(); renderDashboard(); renderVista();
 renderSeguridad();
   toast('Reporte guardado');
@@ -3389,22 +3333,8 @@ function eliminarReporteTurno(groupKey){
   const g=controlRowsCache.find(x=>x.key===groupKey);
   if(!g) return;
   if(!confirm('¿Eliminar el reporte enviado para este turno?')) return;
-
-  const novedadesABorrar = novedades.filter(n=>n.empId===g.empId && n.turnoId===g.turnoId && fmtDate(new Date(n.ts))===fmtDate(g.fechaObj));
-
   delete novedadesXTurno[g.key];
   novedades=novedades.filter(n=>!(n.empId===g.empId && n.turnoId===g.turnoId && fmtDate(new Date(n.ts))===fmtDate(g.fechaObj)));
-
-  guardarNovedadesLocales();
-  persistirControlLocal();
-
-  if(fbReady){
-    novedadesABorrar.forEach(n=>{
-      const fbKey = n._fbKey || n.fbKey || fbNovedadesKeys[g.key] || fbNovedadesKeys[n.id];
-      if(fbKey) fbRemove('novedades/'+fbKey);
-    });
-  }
-
   renderControl(); renderDashboard(); renderVista();
 renderSeguridad();
   toast('Reporte eliminado');
@@ -3960,7 +3890,7 @@ function guardarEmpleado(){
   const cargo=document.getElementById('em-cargo').value.trim()||'Sereno';
   const tel=document.getElementById('em-tel').value.trim();
   if(editandoEmpId){const e=empleados.find(x=>x.id===editandoEmpId);e.nombre=nombre;e.cargo=cargo;e.tel=tel;}
-  else empleados.push(normalizarEmpleadoCredenciales({id:nextId++,nombre,cargo,tel,activo:true,usuario:sugerirUsuario(nombre),password:''}));
+  else empleados.push({id:nextId++,nombre,cargo,tel,activo:true,usuario:sugerirUsuario(nombre),password:'1234'});
   guardarEmpleadosEnStorage();
   cerrarModalEmp2();renderEmpleados();poblarSelects();renderSeguridad();
   document.getElementById('stat-total').textContent=empleados.filter(x=>x.cargo==='Sereno').length;
@@ -3987,10 +3917,8 @@ function guardarCredenciales(id){
   const e=empleados.find(x=>x.id===id); if(!e) return;
   const usuario=(document.getElementById(`seg-user-${id}`)?.value||'').trim();
   const password=(document.getElementById(`seg-pass-${id}`)?.value||'').trim();
-  if(!usuario){ alert('El usuario es obligatorio'); return; }
-  if(usuario==='ortega.carlos' && password!=='864088'){ alert('La contraseña del supervisor ortega.carlos es fija: 864088'); return; }
-  if(usuario!=='ortega.carlos' && (!/^\d{6}$/.test(password))){ alert('La contraseña debe tener 6 dígitos'); return; }
-  e.usuario=usuario; e.password=(usuario==='ortega.carlos'?'864088':password);
+  if(!usuario||!password){ alert('Usuario y contraseña son obligatorios'); return; }
+  e.usuario=usuario; e.password=password;
   guardarEmpleadosEnStorage();
   toast(`Credenciales actualizadas — ${e.nombre}`);
   renderSeguridad();
@@ -3999,10 +3927,10 @@ function autogenerarCredenciales(id){
   if(!protegerEdicion()) return;
   const e=empleados.find(x=>x.id===id); if(!e) return;
   e.usuario=sugerirUsuario(e.nombre);
-  e.password=String(Math.floor(100000 + Math.random()*900000));
+  e.password='1234';
   guardarEmpleadosEnStorage();
   renderSeguridad();
-  toast(`Clave de 6 dígitos generada — ${e.nombre}`);
+  toast(`Credenciales automáticas generadas — ${e.nombre}`);
 }
 
 // ══ DASHBOARD ══
@@ -4075,27 +4003,6 @@ prepararSesionSegunUsuario();
 
 // ══ FIREBASE SYNC ══
 function initFirebaseSync(){
-
-  // ── EMPLEADOS / CREDENCIALES ──
-  fbListen('empleados', data => {
-    if(data && typeof data === 'object' && Object.keys(data).length){
-      empleados = Object.values(data).filter(Boolean).map(e => normalizarEmpleadoCredenciales({activo:true,tel:'',cargo:'Sereno',...e}));
-      nextId = empleados.reduce((m,e)=>Math.max(m, Number(e.id)||0),0) + 1;
-      guardarEmpleadosEnStorage();
-      renderSeguridad();
-      renderEmpleados();
-      poblarSelects();
-      renderControl();
-      aplicarPermisosUI();
-      if(currentUser) actualizarSessionUI();
-      const huboCambios = Object.values(data).some(e => normalizarPasswordEmpleado(e)!==(e?.password ?? '').toString() || (((String(e?.usuario||'').trim().toLowerCase()==='ortega.carlos') || String(e?.nombre||'').toLowerCase().includes('ortega carlos') || e?.cargo==='Encargado') && e?.usuario!=='ortega.carlos'));
-      if(huboCambios && canEdit && canEdit()) syncEmpleadosEnNube();
-    }else{
-      sanitizarCredencialesEmpleados();
-      guardarEmpleadosEnStorage();
-      syncEmpleadosEnNube();
-    }
-  });
 
   // ── HORARIOS: supervisor escribe, todos leen ──
   fbListen('horarios', data => {
